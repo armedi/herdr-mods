@@ -22,7 +22,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { terminals, spaces, panes, theme, run, props, home, readTextFile, watchFolder, knownAgents, nextCommand, shared, exec, notify, appHome, layout as windowLayout } from "herdr";
-import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf } from "./model.js";
+import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf, reported } from "./model.js";
 import { Live } from "./live.js";
 
 // Whether layout node `id` is on screen: it and every ancestor not hidden, and every stack on the
@@ -114,9 +114,14 @@ const store = {
   },
 };
 
-// The fields this view shows, read once per render (never the title, which ticks).
+// When each reported sub-agent was first seen (see reported() in model.js).
+let subSeen = new Map();
+
+// The fields this view shows, read once per render (never the title, which ticks), then the
+// sub-agents those terminals report on.
 function liveTerminals() {
-  return terminals().map((t) => {
+  const raw = terminals();
+  const terms = raw.map((t) => {
     const p = t.program;
     return {
       address: t.address,
@@ -135,6 +140,9 @@ function liveTerminals() {
       program: p ? { name: p.name, icon: p.icon, tint: p.tint, agent: p.agent } : null,
     };
   });
+  const subs = reported(raw.map((t, i) => ({ term: terms[i], records: t.records })), subSeen, Date.now());
+  subSeen = subs.seen;
+  return [...terms, ...subs.children];
 }
 
 // The id Herdr writes in a terminal's herdr.space / herdr.tab label (local to its machine).
@@ -211,13 +219,18 @@ function describe(n, worked) {
   // The program first, then what it runs (a model, a test filter) and why it may be quiet.
   const program = n.live?.program?.name ?? n.rec?.agent ?? null;
   const command = n.rec?.command || n.live?.argv?.join(" ") || n.live?.program?.name || n.rec?.agent;
-  const resumable = Boolean(n.rec && n.live?.state !== "live" && RESUMABLE.has(agentOf(n.rec)));
+  // A reported sub-agent has no terminal and no session of its own: a click peeks its parent's.
+  const sub = Boolean(n.live?.sub);
+  const resumable = !sub && Boolean(n.rec && n.live?.state !== "live" && RESUMABLE.has(agentOf(n.rec)));
   return {
     f,
     o,
     title: name,
-    meta: [n.address, program, f.removed != null ? "removed" : null, f.notSeen ? "not seen" : null,
-      command && command !== program ? command : null].filter(Boolean).join(" · "),
+    meta: sub
+      ? [n.live.parent, "sub-agent", n.live.msg].filter(Boolean).join(" · ")
+      : [n.address, program, f.removed != null ? "removed" : null, f.notSeen ? "not seen" : null,
+        command && command !== program ? command : null].filter(Boolean).join(" · "),
+    peek: sub ? n.live.parent : n.address,
     program: n.live?.program ?? recordedProgram(n.rec),
     letter: (n.rec?.agent || name || "?").replace(/[^\p{L}\p{N}]/gu, "").charAt(0).toUpperCase() || "?",
     done: isDone(n, f, o, worked),
@@ -797,7 +810,7 @@ export default class AgentGraph extends View {
       .bg(t.background)
       .border_color(v.loud ? t.blocked : t.border)
       .when(f.removed != null, (el) => el.opacity(0.55))
-      .when(v.peekable || v.resumable, (el) => el.cursor_pointer().hover((s) => s.border_color(t.accent)).on_click(() => v.peekable ? run("terminal.peek", { terminal: n.address }) : this.resume(n)))
+      .when(v.peekable || v.resumable, (el) => el.cursor_pointer().hover((s) => s.border_color(t.accent)).on_click(() => v.peekable ? run("terminal.peek", { terminal: v.peek }) : this.resume(n)))
       // A live card carries its program's icon; a recorded agent's card its agent's logo.
       .child(v.program?.icon ? h_flex().gap(7).items_center().child(glyph(t, v, 14)).child(title.flex_1()) : title.w_full())
       .child(word)

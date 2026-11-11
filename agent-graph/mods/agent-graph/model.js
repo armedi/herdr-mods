@@ -16,13 +16,56 @@ export const RESUMABLE = new Set(["claude", "claude-code", "codex", "grok", "gro
 /** A record's agent word: hc's `agent`, else the basename of its command's first word. */
 export const agentOf = (rec) => rec.agent || (rec.command || "").trim().split(/\s+/)[0].split("/").pop();
 
+/**
+ * The sub-agents live terminals report on, as terminal-shaped children of them. hc keeps every
+ * OSC 7501 record other than a program's root one in the terminal's `records`, by id: Claude Code
+ * sends one per running Agent-tool sub-agent, titled with its description, and clears it when the
+ * sub-agent finishes. A child's address is `<terminal>#<id>`, the id URI-encoded so that a "/" in
+ * it can't read as a machine prefix. Records carry no start time, so `seen` (address -> ms) says
+ * when each child was first seen; the returned map keeps only the children still reported.
+ * list: [{ term, records }], term as main.js's liveTerminals() gives it, records as hc's.
+ */
+export function reported(list, seen, now) {
+  const children = [];
+  const next = new Map();
+  for (const { term, records } of list) {
+    if (term.state !== "live" || !records || typeof records !== "object") continue;
+    for (const [id, r] of Object.entries(records)) {
+      if (!id || typeof r?.state !== "string") continue;
+      const address = `${term.address}#${encodeURIComponent(id)}`;
+      const seenMs = seen.get(address) ?? now;
+      next.set(address, seenMs);
+      children.push({
+        address,
+        parent: term.address,
+        created_ms: null,
+        finished_ms: null,
+        exit_code: null,
+        reason: null,
+        state: "live",
+        status: r.state,
+        name: r.title || "sub-agent",
+        template: null,
+        argv: null,
+        space_label: term.space_label,
+        tab_label: term.tab_label,
+        program: term.program,
+        sub: true,
+        msg: r.msg || null,
+        seen_ms: seenMs,
+      });
+    }
+  }
+  return { children, seen: next };
+}
+
 export function parseHistory(text) {
   const data = JSON.parse(text);
   if (!data || !Array.isArray(data.records)) throw new Error("no records list");
   return data.records.filter((r) => r && typeof r.id === "string" && typeof r.address === "string");
 }
 
-const createdOf = (n) => n.rec?.created_ms ?? n.live?.created_ms ?? 0;
+const createdOf = (n) => n.rec?.created_ms ?? n.live?.created_ms ?? n.live?.seen_ms ?? 0;
 
 // The record FORMAT.md's parent_id would name: that address, latest created_ms not after the child's.
 function recordedParent(list, created) {
@@ -148,7 +191,7 @@ export function facts(n) {
   return {
     state: l ? l.state : r.state,
     status: l ? l.status ?? null : r.status ?? null,
-    created: r?.created_ms ?? l?.created_ms ?? null,
+    created: r?.created_ms ?? l?.created_ms ?? l?.seen_ms ?? null,
     finished: (liveFinished ? l.finished_ms : null) ?? r?.finished_ms ?? null,
     exit_code: liveFinished ? l.exit_code ?? null : r?.exit_code ?? null,
     reason: liveFinished ? l.reason ?? null : r?.reason ?? null,
