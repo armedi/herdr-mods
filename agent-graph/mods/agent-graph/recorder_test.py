@@ -250,6 +250,93 @@ class RecorderTest(unittest.TestCase):
         self.assertLess(len(data), 900000)
         self.assertGreater(len(d["records"]), 0)
 
+    def test_16_sub_agents_from_status_events(self):
+        feed(self.rec, snapshot(term("t1", 100, argv=["claude"], labels={"where": "space / tab"})))
+        self.rec.apply_listing({"machines": [], "terminals": [
+            {"address": "t1", "agent": "claude-code", "state": "live"}]}, NOW)
+        root = {"app": "claude-code", "state": "working"}
+        self.rec.handle_line(event("status", "t1", {"status": root, "reported": True, "records": {
+            "a1": {"app": "claude-code", "state": "working", "title": "Find the parser"}}}), NOW + 10)
+        r = by_id(self.snap())[f"t1#a1@{NOW + 10}"]
+        self.assertEqual((r["address"], r["parent"], r["parent_id"], r["name"], r["status"], r["state"]),
+                         ("t1#a1", "t1", "t1@100", "Find the parser", "working", "live"))
+        self.assertEqual((r["agent"], r["cwd"], r["where"], r["command"]),
+                         ("claude-code", "/tmp", "space / tab", None))
+        self.rec.handle_line(event("status", "t1", {"status": root, "reported": True, "records": {}}), NOW + 20)
+        r = by_id(self.snap())[f"t1#a1@{NOW + 10}"]
+        self.assertEqual((r["state"], r["finished_ms"], r["exit_code"], r["reason"], r["removed_ms"]),
+                         ("finished", NOW + 20, None, None, None))
+        self.assertEqual(self.rec.current, {"t1": "t1@100"})
+
+    def test_17_sub_agents_end_with_their_terminal(self):
+        feed(self.rec, snapshot(term("t1", 100), term("t2", 200)))
+        feed(self.rec, event("status", "t1", {"records": {"a1": {"state": "working"}}}),
+             event("status", "t2", {"records": {"a2": {"state": "blocked"}}}), now=NOW + 5)
+        self.rec.handle_line(event("finished", "t1", {"exit_code": 0, "finished_ms": NOW + 29, "reason": "exited"}), NOW + 30)
+        self.rec.handle_line(event("removed", "t2", {}), NOW + 40)
+        recs = by_id(self.snap())
+        a1, a2 = recs[f"t1#a1@{NOW + 5}"], recs[f"t2#a2@{NOW + 5}"]
+        self.assertEqual((a1["state"], a1["finished_ms"]), ("finished", NOW + 30))
+        self.assertEqual((a2["state"], a2["finished_ms"], a2["removed_ms"]), ("finished", NOW + 40, None))
+        self.assertEqual(self.rec.current, {"t1": "t1@100"})
+
+    def test_18_sub_agents_in_snapshots_and_listings(self):
+        t1 = term("t1", 100, records={"a1": {"state": "working", "title": "x"}, "a2": {"state": "working"}})
+        feed(self.rec, snapshot(t1))
+        # A later snapshot (after a reconnect) lists no sub-agent as a terminal of its own.
+        feed(self.rec, snapshot(t1), now=NOW + 5)
+        # Nor does `hc ls`, which has no records at all.
+        self.rec.apply_listing({"machines": [], "terminals": [
+            {"address": "t1", "agent": "claude-code", "cwd": "/tmp", "name": "t1", "state": "live",
+             "status": "working", "turn": 0}]}, NOW + 9)
+        recs = by_id(self.snap())
+        self.assertEqual({i for i in recs if "#" in i}, {f"t1#a1@{NOW}", f"t1#a2@{NOW}"})
+        self.assertTrue(all(recs[i]["state"] == "live" and recs[i]["removed_ms"] is None for i in recs))
+        self.assertEqual(set(self.rec.current), {"t1", "t1#a1", "t1#a2"})
+
+    def test_19_sub_agents_on_another_machine(self):
+        feed(self.rec, event("created", "remote/t3", term("remote/t3", 100, parent="t1",
+                                                          records={"a1": {"state": "working"}})))
+        self.rec.apply_listing({"machines": [{"name": "remote", "state": "connected"}], "terminals": [
+            {"address": "remote/t3", "state": "live"}]}, NOW + 1)
+        r = by_id(self.snap())[f"remote/t3#a1@{NOW}"]
+        self.assertEqual((r["parent"], r["parent_id"], r["state"], r["removed_ms"]),
+                         ("remote/t3", "remote/t3@100", "live", None))
+
+    def test_20_sub_agents_after_a_restart(self):
+        both = {"a1": {"state": "working"}, "a2": {"state": "working"}}
+        feed(self.rec, snapshot(term("t1", 100, records=both)))
+        feed(self.rec, event("status", "t1", {"records": {"a1": {"state": "working"}}}), now=NOW + 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            self.rec.flush(path, NOW + 6)
+            rec = recorder.Recorder()
+            rec.load(path)
+        # The finished one is gone from the core, the running one is still there.
+        self.assertEqual(rec.current, {"t1": "t1@100", "t1#a1": f"t1#a1@{NOW}"})
+        feed(rec, snapshot(term("t1", 100, records={"a1": {"state": "working"}})), now=NOW + 60)
+        recs = by_id(rec.snapshot_dict(NOW + 60))
+        self.assertEqual(set(recs), {"t1@100", f"t1#a1@{NOW}", f"t1#a2@{NOW}"})
+        self.assertEqual(recs[f"t1#a2@{NOW}"]["finished_ms"], NOW + 5)
+
+    def test_21_sub_address_matches_main_js_byte_for_byte(self):
+        # main.js builds the live sub-agent's address with encodeURIComponent and matches this
+        # record by it; model_test.mjs pins the same string.
+        self.assertEqual(recorder.sub_address("box/t7", "x/y z#é!'()*~-_."),
+                         "box/t7#x%2Fy%20z%23%C3%A9!'()*~-_.")
+
+    def test_22_sub_agents_take_the_agent_the_listing_names_later(self):
+        # A sub-agent can start and finish before the next `hc ls` names its terminal's agent.
+        feed(self.rec, snapshot(term("t1", 100)))
+        feed(self.rec, event("status", "t1", {"records": {"a1": {"state": "working"}}}), now=NOW + 1)
+        feed(self.rec, event("status", "t1", {"records": {}}), now=NOW + 2)
+        self.rec.apply_listing({"machines": [], "terminals": [
+            {"address": "t1", "agent": "claude-code", "state": "live"}]}, NOW + 3)
+        feed(self.rec, event("status", "t1", {"records": {"a2": {"state": "working"}}}), now=NOW + 4)
+        recs = by_id(self.snap())
+        self.assertEqual(recs[f"t1#a1@{NOW + 1}"]["agent"], "claude-code")
+        self.assertEqual(recs[f"t1#a2@{NOW + 4}"]["agent"], "claude-code")
+
 
 class ProcessTest(unittest.TestCase):
     def run_replay(self, tmp, lines):

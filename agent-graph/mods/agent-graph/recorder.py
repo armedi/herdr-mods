@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 DEFAULT_OUT = "~/.local/share/herdr-agent-graph/history.json"
 VERSION = 1
@@ -72,6 +73,22 @@ def qualify_parent(child_address, parent):
     if prefix and "/" not in parent:
         return f"{prefix}/{parent}"
     return parent
+
+
+# What encodeURIComponent leaves as it is, besides what quote() always keeps.
+URI_COMPONENT_SAFE = "!'()*"
+
+
+def sub_address(address, record_id):
+    """A reported sub-agent's address: its terminal's, `#`, then the record id percent-encoded the
+    way JavaScript's encodeURIComponent does it, because main.js builds the same address for the
+    live sub-agent and matches it to this record by address."""
+    return f"{address}#{quote(record_id, safe=URI_COMPONENT_SAFE)}"
+
+
+def is_sub(rec):
+    parent = rec.get("parent")
+    return isinstance(parent, str) and rec["address"].startswith(parent + "#")
 
 
 def is_int(v):
@@ -152,7 +169,8 @@ class Recorder:
             rec["status"] = norm_status(rec["status"])
             self.records[rec["id"]] = rec
         for rec in self.records.values():
-            if rec["removed_ms"] is not None:
+            # A finished sub-agent is gone from the core even though nothing removed it.
+            if rec["removed_ms"] is not None or (is_sub(rec) and rec["state"] == "finished"):
                 continue
             cur = self.records.get(self.current.get(rec["address"]))
             if cur is None or rec["created_ms"] > cur["created_ms"]:
@@ -166,6 +184,49 @@ class Recorder:
             return
         self.set(self.records[rid], "removed_ms", now)
         self.touch()  # the record set changed (current shrank)
+        for child in self.live_subs(address):
+            self.finish_sub(child, now)
+
+    # -- reported sub-agents (hc's `records`, see FORMAT.md) ---------------
+
+    def live_subs(self, address):
+        prefix = address + "#"
+        return [self.records[rid] for a, rid in self.current.items() if a.startswith(prefix)]
+
+    def finish_sub(self, rec, now):
+        self.set(rec, "state", "finished")
+        self.set(rec, "finished_ms", now)
+        self.current.pop(rec["address"], None)
+        self.touch()
+
+    def sync_subs(self, address, records, now):
+        """One record per sub-agent the terminal reports: an id that appears starts one, an id that
+        goes (or the terminal finishing) finishes it."""
+        rid = self.current.get(address)
+        if rid is None:
+            return
+        parent = self.records[rid]
+        reported = {}
+        if parent["state"] == "live" and isinstance(records, dict):
+            for record_id, r in records.items():
+                if isinstance(record_id, str) and record_id and isinstance(r, dict) and norm_status(r):
+                    reported[sub_address(address, record_id)] = r
+        for child in self.live_subs(address):
+            if child["address"] not in reported:
+                self.finish_sub(child, now)
+        for child_address, r in reported.items():
+            rec = self.records.get(self.current.get(child_address))
+            if rec is None:
+                rec = {k: None for k in KEYS}
+                rec.update(id=f"{child_address}@{now}", address=child_address, parent=address,
+                           created_ms=now, state="live")
+                self.records[rec["id"]] = rec
+                self.current[child_address] = rec["id"]
+                self.touch()
+            self.set(rec, "name", clip(r.get("title"), 120))
+            self.set(rec, "status", norm_status(r))
+            for k in ("agent", "cwd", "where"):
+                self.set(rec, k, parent[k])
 
     def upsert(self, r, now):
         if not isinstance(r, dict):
@@ -206,6 +267,8 @@ class Recorder:
         if self.current.get(address) != rid:
             self.current[address] = rid
             self.touch()
+        if "records" in r:
+            self.sync_subs(address, r["records"], now)
 
     def handle_snapshot(self, terminals, now):
         seen = set()
@@ -214,6 +277,10 @@ class Recorder:
             if isinstance(t, dict) and isinstance(t.get("address"), str):
                 seen.add(t["address"])
         for address in list(self.current):
+            # Sub-agents are never listed as terminals: they follow their terminal's records.
+            rid = self.current.get(address)
+            if rid is None or is_sub(self.records[rid]):
+                continue
             if machine_of(address) is None and address not in seen:
                 self.remove(address, now)
 
@@ -236,12 +303,15 @@ class Recorder:
             self.set(rec, "finished_ms", data.get("finished_ms"))
             self.set(rec, "reason", data.get("reason"))
             self.set(rec, "state", "finished")
+            self.sync_subs(address, None, now)
         elif etype == "labels":
             labels = data.get("labels")
             if isinstance(labels, dict):
                 self.set(rec, "where", clip(labels.get("where"), 160))
         elif etype == "status":
             self.set(rec, "status", norm_status(data.get("status")))
+            if "records" in data:
+                self.sync_subs(address, data["records"], now)
         elif etype == "removed":
             self.remove(address, now)
 
@@ -284,12 +354,23 @@ class Recorder:
                 continue
             rec = self.records[rid]
             agent = t.get("agent")
-            self.set(rec, "agent", agent if isinstance(agent, str) else None)
+            agent = agent if isinstance(agent, str) else None
+            if rec["agent"] != agent:
+                self.set(rec, "agent", agent)
+                # Only the listing names the agent, so sub-agents seen before it, finished ones
+                # too, take it now.
+                for child in self.records.values():
+                    if child["parent"] == address and child["created_ms"] >= rec["created_ms"] and is_sub(child):
+                        self.set(child, "agent", agent)
             if "status" in t:
                 self.set(rec, "status", norm_status(t["status"]))
             if isinstance(t.get("state"), str):
                 self.set(rec, "state", t["state"])
         for address in list(self.current):
+            # The listing has no sub-agents: they follow their terminal's records.
+            rid = self.current.get(address)
+            if rid is None or is_sub(self.records[rid]):
+                continue
             if address not in listed and machine_of(address) in connected:
                 self.remove(address, now)
 

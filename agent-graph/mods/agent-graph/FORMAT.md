@@ -50,6 +50,15 @@ so a bad read never destroys it.
   `removed_ms`: when the recorder saw the terminal disappear (`hc rm`, or gone from its connected
   machine's listing); null while it exists, and also null when the recorder never saw it go (so a
   null `removed_ms` does not prove the terminal still exists).
+- A sub-agent a terminal reports (an OSC 7501 record other than the program's root one, kept by
+  hc in the terminal's `records` by id, as Claude Code does for each running Agent-tool
+  sub-agent) is a record too. Its `address` is `<terminal address>#<record id>`, the id
+  percent-encoded the way JavaScript's `encodeURIComponent` does it (`t7#a1`, `machine/t7#a1`);
+  `parent` is the terminal's address; `name` is the record's title; `status` its state; `agent`,
+  `cwd` and `where` are the terminal's; `command` is null. `created_ms` is when the recorder first
+  saw the record. When the terminal stops reporting it, finishes or is removed, the record becomes
+  `finished` with that time as `finished_ms`; `exit_code`, `reason` and `removed_ms` stay null,
+  since the program doesn't say how a sub-agent ended.
 - Text limits (characters, longer values cut and ended with `…`): `command` 200 (argv joined with
   spaces), `cwd` 300, `name` 120, `where` 160.
 - Times are Unix milliseconds. Records are sorted by `created_ms` ascending.
